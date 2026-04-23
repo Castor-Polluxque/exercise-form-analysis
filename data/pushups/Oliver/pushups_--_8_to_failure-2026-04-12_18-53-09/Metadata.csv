@@ -1,0 +1,2 @@
+version,device name,recording epoch time,recording time,recording timezone,platform,appVersion,device id,sensors,sampleRateMs,standardisation,platform version
+3,iPhone SE (3rd generation),1776019989322,2026-04-12_18-53-09,America/Chicago,ios,1.56,8cfa0e45-e9cb-44bc-b06a-1b0fd6d8a52a,Accelerometer|Gravity|Gyroscope|Orientation|Magnetometer|Annotation|MagnetometerUncalibrated|GyroscopeUncalibrated|AccelerometerUncalibrated,10|10|10|10|10||10|10|10,false,26.3.1
