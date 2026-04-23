@@ -38,7 +38,16 @@ from scipy.ndimage import uniform_filter1d
 from scipy.signal import butter, filtfilt, find_peaks, hilbert, welch
 
 # ----------------------------- Tunables ------------------------------------- #
-TIME_ALIASES = ["seconds_elapsed", "time", "Time", "timestamp", "Timestamp", "elapsed", "t"]
+TIME_ALIASES = [
+    "seconds_elapsed",
+    "time",
+    "Time",
+    "timestamp",
+    "Timestamp",
+    "absolute_timestamp",
+    "elapsed",
+    "t",
+]
 
 SENSOR_FILES = {
     "Accelerometer": "Accelerometer.csv",
@@ -50,6 +59,29 @@ SENSOR_FILES = {
 
 ORIENTATION_AXES = ["pitch", "roll", "yaw", "azimuth"]
 XYZ_AXES = ["x", "y", "z"]
+
+GENERIC_SENSOR_COLUMN_MAPS: Dict[str, List[Dict[str, str]]] = {
+    "Accelerometer": [
+        {"x": "accel_x", "y": "accel_y", "z": "accel_z"},
+        {"x": "accelerometer_x", "y": "accelerometer_y", "z": "accelerometer_z"},
+    ],
+    "Gyroscope": [
+        {"x": "gyro_x", "y": "gyro_y", "z": "gyro_z"},
+        {"x": "gyroscope_x", "y": "gyroscope_y", "z": "gyroscope_z"},
+    ],
+    "Gravity": [
+        {"x": "gravity_x", "y": "gravity_y", "z": "gravity_z"},
+    ],
+    "Magnetometer": [
+        {"x": "mag_x", "y": "mag_y", "z": "mag_z"},
+        {"x": "magnetometer_x", "y": "magnetometer_y", "z": "magnetometer_z"},
+    ],
+}
+
+GENERIC_ORIENTATION_COLUMN_MAPS: List[Dict[str, str]] = [
+    {"pitch": "pitch", "roll": "roll", "yaw": "yaw"},
+    {"pitch": "orientation_pitch", "roll": "orientation_roll", "yaw": "orientation_yaw"},
+]
 
 BAND_LO_HZ = 0.10
 BAND_HI_HZ = 0.80
@@ -212,6 +244,128 @@ def _find_time_col(df: pd.DataFrame) -> Optional[str]:
         if alias.lower() in lm:
             return lm[alias.lower()]
     return None
+
+
+def _normalize_time_to_elapsed_seconds(t: Sequence[float]) -> np.ndarray:
+    """
+    Convert absolute timestamps to elapsed seconds.
+
+    Handles common IMU exports that use Unix epoch values in nanoseconds,
+    microseconds, milliseconds, or seconds.
+    """
+    arr = np.asarray(t, dtype=float).copy()
+    finite = np.isfinite(arr)
+    if not np.any(finite):
+        return arr
+
+    vals = arr[finite]
+    abs_max = float(np.nanmax(np.abs(vals)))
+    uniq = np.unique(vals)
+    diffs = np.diff(np.sort(uniq))
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+    dt_med = float(np.median(diffs)) if len(diffs) else float("nan")
+
+    scale = 1.0
+    if abs_max >= 1e17 or (np.isfinite(dt_med) and dt_med >= 1e7):
+        scale = 1e9
+    elif abs_max >= 1e14 or (np.isfinite(dt_med) and dt_med >= 1e4):
+        scale = 1e6
+    elif abs_max >= 1e11 or (np.isfinite(dt_med) and dt_med >= 10.0):
+        scale = 1e3
+
+    arr[finite] = arr[finite] / scale
+    origin = float(arr[finite][0])
+    arr[finite] = arr[finite] - origin
+    return arr
+
+
+def _extract_axes(df: pd.DataFrame, axis_map: Dict[str, str]) -> Optional[Dict[str, np.ndarray]]:
+    axes: Dict[str, np.ndarray] = {}
+    for axis, col in axis_map.items():
+        if col not in df.columns:
+            return None
+        axes[axis] = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+    return axes
+
+
+def _infer_generic_sensor_label(path: Path, sensor_name: str) -> str:
+    stem = path.stem.strip().replace(" ", "_")
+    suffix = sensor_name.lower()
+    if stem.lower().endswith(suffix):
+        return stem
+    return f"{stem}_{suffix}"
+
+
+def _load_sensor_tables_for_session(session_dir: Path) -> List[Dict[str, Any]]:
+    tables: List[Dict[str, Any]] = []
+
+    for sensor_name, filename in SENSOR_FILES.items():
+        fp = session_dir / filename
+        if not fp.exists():
+            continue
+        try:
+            df = pd.read_csv(fp)
+        except Exception:
+            continue
+
+        tcol = _find_time_col(df)
+        if tcol is None:
+            continue
+        t = _normalize_time_to_elapsed_seconds(pd.to_numeric(df[tcol], errors="coerce").to_numpy(dtype=float))
+
+        if sensor_name == "Orientation":
+            axes = {axis: pd.to_numeric(df[axis], errors="coerce").to_numpy(dtype=float) for axis in ORIENTATION_AXES if axis in df.columns}
+        else:
+            axes = {axis: pd.to_numeric(df[axis], errors="coerce").to_numpy(dtype=float) for axis in XYZ_AXES if axis in df.columns}
+
+        if axes:
+            tables.append({"sensor": sensor_name, "time": t, "axes": axes, "path": fp})
+
+    for fp in sorted(session_dir.glob("*.csv")):
+        if fp.name in SENSOR_FILES.values():
+            continue
+        try:
+            df = pd.read_csv(fp)
+        except Exception:
+            continue
+
+        tcol = _find_time_col(df)
+        if tcol is None:
+            continue
+        t = _normalize_time_to_elapsed_seconds(pd.to_numeric(df[tcol], errors="coerce").to_numpy(dtype=float))
+
+        for sensor_name, maps in GENERIC_SENSOR_COLUMN_MAPS.items():
+            axes = None
+            for axis_map in maps:
+                axes = _extract_axes(df, axis_map)
+                if axes is not None:
+                    break
+            if axes:
+                tables.append(
+                    {
+                        "sensor": _infer_generic_sensor_label(fp, sensor_name),
+                        "time": t,
+                        "axes": axes,
+                        "path": fp,
+                    }
+                )
+
+        orient_axes = None
+        for axis_map in GENERIC_ORIENTATION_COLUMN_MAPS:
+            orient_axes = _extract_axes(df, axis_map)
+            if orient_axes is not None:
+                break
+        if orient_axes:
+            tables.append(
+                {
+                    "sensor": _infer_generic_sensor_label(fp, "Orientation"),
+                    "time": t,
+                    "axes": orient_axes,
+                    "path": fp,
+                }
+            )
+
+    return tables
 
 
 def _bandpass(sig: np.ndarray, fs: float, lo_hz: float = BAND_LO_HZ, hi_hz: float = BAND_HI_HZ) -> np.ndarray:
@@ -791,31 +945,12 @@ def _detect_channel(t_raw: np.ndarray, x_raw: np.ndarray, sensor: str, axis: str
 def _load_channels_for_session(session_dir: Path) -> List[Tuple[str, str, np.ndarray, np.ndarray]]:
     channels: List[Tuple[str, str, np.ndarray, np.ndarray]] = []
 
-    for sensor_name, filename in SENSOR_FILES.items():
-        fp = session_dir / filename
-        if not fp.exists():
-            continue
-        try:
-            df = pd.read_csv(fp)
-        except Exception:
-            continue
-
-        tcol = _find_time_col(df)
-        if tcol is None:
-            continue
-        t = pd.to_numeric(df[tcol], errors="coerce").to_numpy(dtype=float)
-
-        if sensor_name == "Orientation":
-            # Prefer canonical orientation channels if present.
-            for axis in ORIENTATION_AXES:
-                if axis in df.columns:
-                    x = pd.to_numeric(df[axis], errors="coerce").to_numpy(dtype=float)
-                    channels.append((sensor_name, axis, t, x))
-        else:
-            for axis in XYZ_AXES:
-                if axis in df.columns:
-                    x = pd.to_numeric(df[axis], errors="coerce").to_numpy(dtype=float)
-                    channels.append((sensor_name, axis, t, x))
+    for table in _load_sensor_tables_for_session(session_dir):
+        sensor_name = str(table["sensor"])
+        t = np.asarray(table["time"], dtype=float)
+        axes = dict(table["axes"])
+        for axis, x in axes.items():
+            channels.append((sensor_name, str(axis), t, np.asarray(x, dtype=float)))
 
     return channels
 
@@ -3311,20 +3446,17 @@ def generate_session_graphs(session_dir: Path, out_dir: Optional[Path] = None) -
         sensor_mats: Dict[str, np.ndarray] = {}
         trust_scores: Dict[str, Dict[str, float]] = {}
 
-        for sensor_name, fname in SENSOR_FILES.items():
-            if sensor_name == 'Orientation':
+        for table in _load_sensor_tables_for_session(session_dir):
+            sensor_name = str(table["sensor"])
+            if sensor_name.lower().endswith("orientation"):
                 continue
-            fp = session_dir / fname
-            if not fp.exists():
+            axes = dict(table["axes"])
+            if any(axn not in axes for axn in ['x', 'y', 'z']):
                 continue
-            df = pd.read_csv(fp)
-            tcol = _find_time_col(df)
-            if tcol is None or any(ax not in df.columns for ax in ['x', 'y', 'z']):
-                continue
-            t = pd.to_numeric(df[tcol], errors='coerce').to_numpy(dtype=float)
+            t = np.asarray(table["time"], dtype=float)
             data = {}
             for axn in ['x', 'y', 'z']:
-                x = pd.to_numeric(df[axn], errors='coerce').to_numpy(dtype=float)
+                x = np.asarray(axes[axn], dtype=float)
                 tt, xx = _ensure_monotonic_time(t, x)
                 if len(tt) < 40:
                     continue
